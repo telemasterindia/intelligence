@@ -135,6 +135,7 @@ export async function getImportSummary(client) {
     )
     SELECT
       COUNT(*)::bigint AS total_records,
+      COUNT(*) FILTER (WHERE is_valid = FALSE)::bigint AS rejected,
       COUNT(*) FILTER (WHERE phone_normalized <> '')::bigint AS valid_phones,
       COUNT(*) FILTER (WHERE phone_normalized = '')::bigint AS invalid_phones,
       COUNT(*) FILTER (WHERE zip_normalized = '')::bigint AS missing_zip,
@@ -144,7 +145,19 @@ export async function getImportSummary(client) {
       COUNT(*) FILTER (WHERE data_age_bucket = 'sixToTwelveMonths')::bigint AS six_to_twelve_months,
       COUNT(*) FILTER (WHERE data_age_bucket = 'oneToTwoYears')::bigint AS one_to_two_years,
       COUNT(*) FILTER (WHERE data_age_bucket = 'twoPlusYears')::bigint AS two_plus_years,
-      COUNT(*) FILTER (WHERE data_age_bucket = 'noDate')::bigint AS no_date
+      COUNT(*) FILTER (WHERE data_age_bucket = 'noDate')::bigint AS no_date,
+      COALESCE(
+        (
+          SELECT jsonb_object_agg(reason, reason_count)
+          FROM (
+            SELECT unnest(validation_errors) AS reason, COUNT(*)::bigint AS reason_count
+            FROM import_stage
+            WHERE is_valid = FALSE
+            GROUP BY reason
+          ) reasons
+        ),
+        '{}'::jsonb
+      ) AS rejection_reasons
     FROM import_stage
   `);
   return result.rows[0];

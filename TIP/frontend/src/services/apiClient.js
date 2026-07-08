@@ -14,7 +14,7 @@ export async function detectCsvColumns(file) {
     method: "POST",
     body: formData
   });
-  if (!response.ok) throw new Error("Unable to detect CSV columns.");
+  if (!response.ok) throw new Error(await readErrorMessage(response, "Unable to detect CSV columns."));
   return response.json();
 }
 
@@ -37,6 +37,9 @@ export async function uploadCsvImport({ file, mapping, duplicateStrategy, vendor
 
   const response = await fetch(`${API_BASE_URL}/imports`, {
     method: "POST",
+    headers: {
+      "X-TIP-Dry-Run": String(Boolean(dryRun))
+    },
     body: formData
   });
   if (!response.ok) throw new Error(await readErrorMessage(response, "Unable to import CSV."));

@@ -114,6 +114,44 @@ function readUploadRequest(req, client) {
   });
 }
 
+function readDryRunRequest(req) {
+  return new Promise((resolve, reject) => {
+    const busboy = Busboy({ headers: req.headers });
+    const fields = {};
+    let fileName = "uploaded.csv";
+    let filePromise = null;
+
+    busboy.on("field", (name, value) => {
+      fields[name] = value;
+    });
+
+    busboy.on("file", (_name, file, info) => {
+      fileName = info.filename || fileName;
+      filePromise = processDryRunFile({ file, fields });
+    });
+
+    busboy.on("error", reject);
+    busboy.on("finish", async () => {
+      try {
+        if (!filePromise) throw createParseError("No CSV file was uploaded.");
+        const result = await filePromise;
+        resolve({ ...result, fileName });
+      } catch (error) {
+        reject(error);
+      }
+    });
+
+    req.pipe(busboy);
+  });
+}
+
+function createParseError(message) {
+  const error = new Error(message);
+  error.statusCode = 400;
+  error.expose = true;
+  return error;
+}
+
 async function processCsvFile({ file, fields, client }) {
   const mapping = parseJsonField(fields.mapping, {});
   const duplicateStrategy = DUPLICATE_STRATEGIES.has(fields.duplicateStrategy)
@@ -127,28 +165,131 @@ async function processCsvFile({ file, fields, client }) {
 
   await createImportStage(client);
 
-  for await (const row of parser) {
-    rowNumber += 1;
-    chunk.push(mapCsvRow(row, rowNumber, mapping));
-    if (chunk.length >= FLUSH_SIZE) {
-      await insertStageRows(client, chunk);
-      chunk = [];
+  try {
+    for await (const row of parser) {
+      rowNumber += 1;
+      chunk.push(mapCsvRow(row, rowNumber, mapping));
+      if (chunk.length >= FLUSH_SIZE) {
+        await insertStageRows(client, chunk);
+        chunk = [];
+      }
     }
+  } catch (error) {
+    throw createParseError(`CSV parsing failed: ${error.message}`);
   }
 
   await insertStageRows(client, chunk);
   return { duplicateStrategy, dryRun, vendorName };
 }
 
-function shapeSummary(raw, imported) {
+async function processDryRunFile({ file, fields }) {
+  const mapping = parseJsonField(fields.mapping, {});
+  const duplicateStrategy = DUPLICATE_STRATEGIES.has(fields.duplicateStrategy)
+    ? fields.duplicateStrategy
+    : "keep_first";
+  const vendorName = fields.vendorName?.trim() || "";
+  const parser = file.pipe(parse({ bom: true, columns: true, skip_empty_lines: true, relax_column_count: true, trim: true }));
+  const summary = createEmptySummary();
+  const phones = new Map();
+  const previewRows = [];
+  const rejectionReasons = new Map();
+
+  try {
+    for await (const row of parser) {
+      const rowNumber = summary.totalRecords + 1;
+      const mapped = mapCsvRow(row, rowNumber, mapping);
+      summary.totalRecords += 1;
+      if (previewRows.length < 25) previewRows.push(row);
+      addAgeBucket(summary, mapped.dataAgeBucket);
+
+      if (mapped.phoneNormalized) summary.validPhones += 1;
+      else summary.invalidPhones += 1;
+      if (!mapped.zipNormalized) summary.missingZip += 1;
+      if (!mapped.stateNormalized) summary.missingState += 1;
+
+      if (!mapped.isValid) {
+        summary.rejected += 1;
+        for (const reason of mapped.validationErrors) {
+          rejectionReasons.set(reason, (rejectionReasons.get(reason) || 0) + 1);
+        }
+        continue;
+      }
+
+      const current = phones.get(mapped.phoneNormalized) || { count: 0 };
+      current.count += 1;
+      phones.set(mapped.phoneNormalized, current);
+    }
+  } catch (error) {
+    throw createParseError(`CSV parsing failed: ${error.message}`);
+  }
+
+  for (const { count } of phones.values()) {
+    if (count > 1) summary.duplicatePhones += count;
+    if (duplicateStrategy === "keep_all") {
+      summary.imported += count;
+    } else {
+      summary.imported += 1;
+      summary.duplicateSkipped += count - 1;
+    }
+  }
+
+  summary.rejectionReasons = Object.fromEntries(rejectionReasons);
+
   return {
-    totalRecords: Number(raw.total_records || 0),
+    batchName: buildBatchName(vendorName, summary.totalRecords),
+    duplicateStrategy,
+    dryRun: true,
+    previewRows,
+    summary,
+    vendorName
+  };
+}
+
+function createEmptySummary() {
+  return {
+    totalRecords: 0,
+    imported: 0,
+    rejected: 0,
+    duplicateSkipped: 0,
+    validPhones: 0,
+    invalidPhones: 0,
+    duplicatePhones: 0,
+    missingZip: 0,
+    missingState: 0,
+    rejectionReasons: {},
+    dataAgeDistribution: {
+      under6Months: 0,
+      sixToTwelveMonths: 0,
+      oneToTwoYears: 0,
+      twoPlusYears: 0,
+      noDate: 0
+    }
+  };
+}
+
+function addAgeBucket(summary, bucket) {
+  if (bucket === "under6Months") summary.dataAgeDistribution.under6Months += 1;
+  if (bucket === "sixToTwelveMonths") summary.dataAgeDistribution.sixToTwelveMonths += 1;
+  if (bucket === "oneToTwoYears") summary.dataAgeDistribution.oneToTwoYears += 1;
+  if (bucket === "twoPlusYears") summary.dataAgeDistribution.twoPlusYears += 1;
+  if (bucket === "noDate") summary.dataAgeDistribution.noDate += 1;
+}
+
+function shapeSummary(raw, imported) {
+  const totalRecords = Number(raw.total_records || 0);
+  const rejected = Number(raw.rejected || 0);
+  const duplicateSkipped = Math.max(0, totalRecords - imported - rejected);
+  return {
+    totalRecords,
     imported,
+    rejected,
+    duplicateSkipped,
     validPhones: Number(raw.valid_phones || 0),
     invalidPhones: Number(raw.invalid_phones || 0),
     duplicatePhones: Number(raw.duplicate_phones || 0),
     missingZip: Number(raw.missing_zip || 0),
     missingState: Number(raw.missing_state || 0),
+    rejectionReasons: raw.rejection_reasons || {},
     dataAgeDistribution: {
       under6Months: Number(raw.under_6_months || 0),
       sixToTwelveMonths: Number(raw.six_to_twelve_months || 0),
@@ -160,6 +301,21 @@ function shapeSummary(raw, imported) {
 }
 
 export async function importCsv(req) {
+  if (req.headers["content-type"]?.includes("multipart/form-data")) {
+    const dryRunHeader = req.headers["x-tip-dry-run"];
+    if (dryRunHeader === "true") {
+      const dryRun = await readDryRunRequest(req);
+      return {
+        batchId: null,
+        batchName: dryRun.batchName,
+        dryRun: true,
+        duplicateStrategy: dryRun.duplicateStrategy,
+        previewRows: dryRun.previewRows,
+        summary: dryRun.summary
+      };
+    }
+  }
+
   return withImportClient(async (client) => {
     const upload = await readUploadRequest(req, client);
     const rawSummary = await getImportSummary(client);

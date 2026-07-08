@@ -74,6 +74,7 @@ export function ImportLeadsPage() {
     try {
       const imported = await uploadCsvImport({ file, mapping, duplicateStrategy, vendorName, dryRun });
       setResult(imported);
+      if (imported.previewRows) setPreviewRows(imported.previewRows);
       setStatus(dryRun ? "Dry run complete. No database records were saved." : "Import complete.");
     } catch (error) {
       setStatus(error.message);
@@ -246,12 +247,27 @@ export function ImportLeadsPage() {
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
             <SummaryValue label="Total Records" value={result.summary.totalRecords} />
             <SummaryValue label="Imported" value={result.summary.imported} />
+            <SummaryValue label="Rejected" value={result.summary.rejected} />
+            <SummaryValue label="Duplicates/Skipped" value={result.summary.duplicateSkipped} />
             <SummaryValue label="Valid Phones" value={result.summary.validPhones} />
             <SummaryValue label="Invalid Phones" value={result.summary.invalidPhones} />
             <SummaryValue label="Duplicate Phones" value={result.summary.duplicatePhones} />
             <SummaryValue label="Missing ZIP" value={result.summary.missingZip} />
             <SummaryValue label="Missing State" value={result.summary.missingState} />
           </div>
+          {Object.keys(result.summary.rejectionReasons || {}).length ? (
+            <>
+              <h3 className="mt-6 text-sm font-semibold text-white">Rejection Reasons</h3>
+              <div className="mt-3 rounded border border-slate-800 bg-tip-background">
+                {Object.entries(result.summary.rejectionReasons).map(([reason, count]) => (
+                  <div className="flex justify-between gap-4 border-b border-slate-800 px-4 py-3 text-sm last:border-b-0" key={reason}>
+                    <span className="text-slate-300">{reason}</span>
+                    <span className="font-semibold text-white">{count}</span>
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : null}
           <h3 className="mt-6 text-sm font-semibold text-white">Data Age Distribution</h3>
           <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
             <SummaryValue label="<6 Months" value={result.summary.dataAgeDistribution.under6Months} />
