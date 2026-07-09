@@ -35,13 +35,15 @@ export async function uploadCsvImport({ file, mapping, duplicateStrategy, vendor
   formData.append("dryRun", String(Boolean(dryRun)));
   formData.append("file", file);
 
-  const response = await fetch(`${API_BASE_URL}/imports`, {
-    method: "POST",
-    headers: {
-      "X-TIP-Dry-Run": String(Boolean(dryRun))
-    },
-    body: formData
-  });
+  let response;
+  try {
+    response = await fetch(`${API_BASE_URL}/imports`, {
+      method: "POST",
+      body: formData
+    });
+  } catch (error) {
+    throw new Error(`Unable to reach import API: ${error.message}`);
+  }
   if (!response.ok) throw new Error(await readErrorMessage(response, "Unable to import CSV."));
   return response.json();
 }
