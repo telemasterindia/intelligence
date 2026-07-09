@@ -51,6 +51,14 @@ export async function createImportBatch(client, { vendorId, batchName, fileName 
   return result.rows[0].id;
 }
 
+export async function insertAuditEvent(client, { action, entityType, entityId, afterState = {}, metadata = {} }) {
+  await client.query(
+    `INSERT INTO audit_log (action, entity_type, entity_id, after_state, metadata)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [action, entityType, entityId, afterState, metadata]
+  );
+}
+
 export async function createImportStage(client) {
   await client.query("DROP TABLE IF EXISTS import_stage");
   await client.query(`
@@ -284,17 +292,26 @@ export async function persistImport(client, { batchId, vendorId, duplicateStrate
       [batchId, imported.rows[0].count, { duplicateStrategy }]
     );
 
-    await client.query(
-      `INSERT INTO audit_log (action, entity_type, entity_id, after_state, metadata)
-       VALUES ('import.completed', 'import_batch', $1, $2, $3)`,
-      [batchId, { acceptedRows: Number(imported.rows[0].count) }, { source: "import_engine" }]
-    );
+    await insertAuditEvent(client, {
+      action: "import.completed",
+      entityType: "import_batch",
+      entityId: batchId,
+      afterState: { acceptedRows: Number(imported.rows[0].count) },
+      metadata: { source: "import_engine" }
+    });
 
     await client.query("COMMIT");
     return Number(imported.rows[0].count);
   } catch (error) {
     await client.query("ROLLBACK");
     await client.query("UPDATE import_batches SET status = 'failed', updated_at = NOW() WHERE id = $1", [batchId]);
+    await insertAuditEvent(client, {
+      action: "import.failed",
+      entityType: "import_batch",
+      entityId: batchId,
+      afterState: { status: "failed", error: error.message },
+      metadata: { source: "import_engine" }
+    });
     throw error;
   }
 }

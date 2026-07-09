@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "node --watch src/server.js",
     "start": "node src/server.js",
-    "db:migrate": "node src/database/migrate.js"
+    "db:migrate": "node src/database/migrate.js",
+    "verify:dry-run": "node src/services/importDryRunVerification.js"
   },
   "dependencies": {
     "busboy": "^1.6.0",

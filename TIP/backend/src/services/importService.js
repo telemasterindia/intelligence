@@ -71,6 +71,15 @@ function parseJsonField(value, fallback) {
   }
 }
 
+function parseMappingField(value) {
+  if (!value) throw createParseError("Column mapping is required before the CSV file is uploaded.");
+  try {
+    return JSON.parse(value);
+  } catch {
+    throw createParseError("Column mapping must be valid JSON.");
+  }
+}
+
 function parseBooleanField(value) {
   return value === "true" || value === true;
 }
@@ -114,12 +123,13 @@ function readUploadRequest(req, client) {
   });
 }
 
-function readDryRunRequest(req) {
+function readImportRequest(req) {
   return new Promise((resolve, reject) => {
     const busboy = Busboy({ headers: req.headers });
     const fields = {};
     let fileName = "uploaded.csv";
     let filePromise = null;
+    const headerDryRun = req.headers["x-tip-dry-run"] === "true";
 
     busboy.on("field", (name, value) => {
       fields[name] = value;
@@ -127,7 +137,21 @@ function readDryRunRequest(req) {
 
     busboy.on("file", (_name, file, info) => {
       fileName = info.filename || fileName;
-      filePromise = processDryRunFile({ file, fields });
+      try {
+        const mapping = parseMappingField(fields.mapping);
+        if (!mapping.phone) {
+          throw createParseError("Phone column mapping is required before running an import or dry run.");
+        }
+
+        if (headerDryRun || parseBooleanField(fields.dryRun)) {
+          filePromise = processDryRunFile({ file, fields });
+        } else {
+          filePromise = withImportClient((client) => processAndPersistImport({ client, file, fields, fileName }));
+        }
+      } catch (error) {
+        file.resume();
+        filePromise = Promise.reject(error);
+      }
     });
 
     busboy.on("error", reject);
@@ -183,7 +207,7 @@ async function processCsvFile({ file, fields, client }) {
 }
 
 async function processDryRunFile({ file, fields }) {
-  const mapping = parseJsonField(fields.mapping, {});
+  const mapping = parseMappingField(fields.mapping);
   const duplicateStrategy = DUPLICATE_STRATEGIES.has(fields.duplicateStrategy)
     ? fields.duplicateStrategy
     : "keep_first";
@@ -301,57 +325,44 @@ function shapeSummary(raw, imported) {
 }
 
 export async function importCsv(req) {
-  if (req.headers["content-type"]?.includes("multipart/form-data")) {
-    const dryRunHeader = req.headers["x-tip-dry-run"];
-    if (dryRunHeader === "true") {
-      const dryRun = await readDryRunRequest(req);
-      return {
-        batchId: null,
-        batchName: dryRun.batchName,
-        dryRun: true,
-        duplicateStrategy: dryRun.duplicateStrategy,
-        previewRows: dryRun.previewRows,
-        summary: dryRun.summary
-      };
-    }
+  const result = await readImportRequest(req);
+  if (result.dryRun) {
+    return {
+      batchId: null,
+      batchName: result.batchName,
+      dryRun: true,
+      duplicateStrategy: result.duplicateStrategy,
+      previewRows: result.previewRows,
+      summary: result.summary
+    };
   }
 
-  return withImportClient(async (client) => {
-    const upload = await readUploadRequest(req, client);
-    const rawSummary = await getImportSummary(client);
-    const batchName = buildBatchName(upload.vendorName, Number(rawSummary.total_records || 0));
-    const importableCount = await getImportableCount(client, upload.duplicateStrategy);
+  return result;
+}
 
-    if (upload.dryRun) {
-      return {
-        batchId: null,
-        batchName,
-        dryRun: true,
-        duplicateStrategy: upload.duplicateStrategy,
-        summary: shapeSummary(rawSummary, importableCount)
-      };
-    }
-
-    const vendorId = await ensureVendor(client, upload.vendorName);
-    const batchId = await createImportBatch(client, {
-      vendorId,
-      batchName,
-      fileName: upload.fileName
-    });
-    const imported = await persistImport(client, {
-      batchId,
-      vendorId,
-      duplicateStrategy: upload.duplicateStrategy
-    });
-
-    return {
-      batchId,
-      batchName,
-      dryRun: false,
-      duplicateStrategy: upload.duplicateStrategy,
-      summary: shapeSummary(rawSummary, imported)
-    };
+async function processAndPersistImport({ client, file, fields, fileName }) {
+  const upload = await processCsvFile({ file, fields, client });
+  const rawSummary = await getImportSummary(client);
+  const batchName = buildBatchName(upload.vendorName, Number(rawSummary.total_records || 0));
+  const vendorId = await ensureVendor(client, upload.vendorName);
+  const batchId = await createImportBatch(client, {
+    vendorId,
+    batchName,
+    fileName
   });
+  const imported = await persistImport(client, {
+    batchId,
+    vendorId,
+    duplicateStrategy: upload.duplicateStrategy
+  });
+
+  return {
+    batchId,
+    batchName,
+    dryRun: false,
+    duplicateStrategy: upload.duplicateStrategy,
+    summary: shapeSummary(rawSummary, imported)
+  };
 }
 
 export function exportImportRecords({ batchId, type }, writable) {
